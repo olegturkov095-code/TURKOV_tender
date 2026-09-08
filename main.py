@@ -45,6 +45,7 @@ SEED_ONLY = os.environ.get("SEED_ONLY", "false").strip().lower() == "true"
 FEEDS = [
     "https://rostender.info/rss-branch-317.xml",
 ]
+FEEDS = ["https://rostender.info/rss-branch-317.xml", "https://rostender.info/rss-category-313.xml",]
 
 # Тендер считается релевантным, если в названии/описании встречается
 # хотя бы одно слово из этого списка.
