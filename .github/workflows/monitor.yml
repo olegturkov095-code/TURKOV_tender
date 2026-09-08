@@ -1,0 +1,41 @@
+name: Tender Monitor
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      seed_only:
+        description: "Только пометить текущие тендеры как увиденные, ничего не отправлять"
+        required: false
+        default: "false"
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  check-tenders:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run tender monitor
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SEED_ONLY: ${{ github.event.inputs.seed_only || 'false' }}
+        run: python main.py
+
+      - name: Save updated state
+        run: |
+          git config user.name "tender-bot"
+          git config user.email "actions@github.com"
+          git add seen_tenders.json
+          git diff --staged --quiet || git commit -m "Обновление списка увиденных тендеров"
+          git push
