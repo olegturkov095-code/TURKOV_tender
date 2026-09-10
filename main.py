@@ -20,12 +20,14 @@
    бот автоматически переключается на резервную сортировку по ключевым словам.
    Отправляем в Telegram ВСЕ тендеры по теме, с пометкой и пояснением, почему.
 5. Для подходящих (✅) тендеров ДОПОЛНИТЕЛЬНО пытаемся найти документацию:
-   если тендер размещён на ЕИС (44-ФЗ/223-ФЗ — там документация публична и
-   бесплатна по закону), бот находит номер извещения, скачивает вложенные
-   PDF/Word-файлы, вытаскивает текст и просит ИИ выделить упомянутые модели
-   оборудования и материалы. Если тендер не с ЕИС, файлы не нашлись или
-   что-то пошло не так — этот шаг просто пропускается, само уведомление
-   всё равно уходит.
+   документы лежат на самой странице тендера на РосТендере, но доступны
+   только авторизованным пользователям. Бот использует cookie сессии
+   (ROSTENDER_COOKIES) вашего аккаунта, чтобы открыть страницу как
+   залогиненный пользователь, находит там ссылки на файлы, скачивает
+   PDF/Word, вытаскивает текст и просит ИИ выделить упомянутые модели
+   оборудования и материалы. Если cookie не задан, устарел, файлы не
+   нашлись или что-то пошло не так — этот шаг просто пропускается, само
+   уведомление всё равно уходит.
 6. Сохраняем обновлённый список увиденных ID.
 
 Требует установки библиотек pypdf и python-docx (см. requirements.txt) —
@@ -57,6 +59,12 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 # автоматически использует старую сортировку по ключевым словам.
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 AI_MODEL = "claude-haiku-4-5-20251001"  # самая быстрая и дешёвая модель — для этой задачи достаточно
+
+# Cookie авторизованной сессии РосТендера (строка вида "name1=value1; name2=value2").
+# Нужна, чтобы бот мог открывать раздел "Документация" на странице тендера —
+# он доступен только залогиненным пользователям. Если не задан, шаг анализа
+# документов просто пропускается.
+ROSTENDER_COOKIES = os.environ.get("ROSTENDER_COOKIES", "")
 
 # Если true — просто помечаем все текущие тендеры как увиденные,
 # ничего не отправляя. Полезно для первого запуска / после смены источников,
@@ -118,8 +126,8 @@ STATE_FILE = Path(__file__).parent / "seen_tenders.json"
 # уведомления. Тендеры, найденные в это время, никуда не пропадают: они
 # просто не помечаются как отправленные и уйдут одним пакетом, как только
 # тихие часы закончатся.
-QUIET_HOURS_START_MSK = 0  # с 22:00 МСК
-QUIET_HOURS_END_MSK = 0     # до 08:00 МСК
+QUIET_HOURS_START_MSK = 22  # с 22:00 МСК
+QUIET_HOURS_END_MSK = 8     # до 08:00 МСК
 
 # ---------------------------------------------------------------------------
 # Анализ документации тендера (ЕИС) — экспериментальная функция
@@ -286,9 +294,12 @@ def classify(title: str, description: str) -> tuple:
 # ---------------------------------------------------------------------------
 
 
-def fetch_url_bytes(url: str, timeout: int = 20, max_bytes: int = 20_000_000) -> bytes:
+def fetch_url_bytes(url: str, timeout: int = 20, max_bytes: int = 20_000_000, use_cookies: bool = False) -> bytes:
     """Скачивает URL, ограничивая размер (защита от случайно огромных файлов)."""
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (TenderMonitorBot/1.0)"})
+    headers = {"User-Agent": "Mozilla/5.0 (TenderMonitorBot/1.0)"}
+    if use_cookies and ROSTENDER_COOKIES:
+        headers["Cookie"] = ROSTENDER_COOKIES
+    req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         data = resp.read(max_bytes + 1)
     if len(data) > max_bytes:
@@ -296,49 +307,29 @@ def fetch_url_bytes(url: str, timeout: int = 20, max_bytes: int = 20_000_000) ->
     return data
 
 
-def find_eis_reg_number(tender_page_url: str) -> tuple:
+def fetch_tender_page_authorized(tender_page_url: str) -> str:
     """
-    Открывает страницу тендера на РосТендере и ищет ссылку/номер на ЕИС.
-    Возвращает (reg_number, law_type) где law_type — "44" или "223",
-    либо (None, None), если тендер не с ЕИС (например, коммерческая площадка).
+    Открывает страницу тендера на РосТендере с cookie авторизованной сессии
+    (если она задана), чтобы увидеть закрытый раздел "Документация".
+    Возвращает HTML страницы или '' при неудаче.
     """
+    if not ROSTENDER_COOKIES:
+        print("[диагностика] ROSTENDER_COOKIES не задан — пропускаем анализ документов")
+        return ""
     try:
-        page_bytes = fetch_url_bytes(tender_page_url, timeout=20, max_bytes=3_000_000)
-        page_text = page_bytes.decode("utf-8", errors="ignore")
+        page_bytes = fetch_url_bytes(tender_page_url, timeout=20, max_bytes=3_000_000, use_cookies=True)
+        return page_bytes.decode("utf-8", errors="ignore")
     except Exception as exc:  # noqa: BLE001
         print(f"[диагностика] Не удалось открыть страницу тендера {tender_page_url}: {exc}")
-        return None, None
-
-    # Прямая ссылка на извещение 44-ФЗ на zakupki.gov.ru
-    m = re.search(r"zakupki\.gov\.ru/epz/order/notice/[^\"'\s]*[?&]regNumber=(\d+)", page_text)
-    if m:
-        return m.group(1), "44"
-
-    # Прямая ссылка на извещение 223-ФЗ
-    m = re.search(r"zakupki\.gov\.ru/223/purchase/public/purchase/info[^\"'\s]*[?&]regNumber=(\d+)", page_text)
-    if m:
-        return m.group(1), "223"
-
-    # Запасной вариант: 19-значный номер извещения 44-ФЗ где-то в тексте
-    m = re.search(r"\b(0\d{18})\b", page_text)
-    if m:
-        return m.group(1), "44"
-
-    return None, None
+        return ""
 
 
-def get_eis_documents_page_url(reg_number: str, law_type: str) -> str:
-    if law_type == "223":
-        return f"https://zakupki.gov.ru/223/purchase/public/purchase/info/documents.html?regNumber={reg_number}"
-    return f"https://zakupki.gov.ru/epz/order/notice/ea44/view/documents.html?regNumber={reg_number}"
-
-
-def extract_document_links(page_html: str) -> list:
+def extract_document_links(page_html: str, base_domain: str = "https://zakupki.gov.ru") -> list:
     """
     Ищет в HTML ссылки на файлы документации (PDF/DOC/XLS/ZIP и т.п.).
-    Реальные ссылки на скачивание в ЕИС часто не содержат расширения в самом
-    URL (там технический ID файла) — расширение видно только в тексте
-    ссылки (например "Техническое задание.pdf"). Проверяем оба варианта.
+    Реальные ссылки на скачивание часто не содержат расширения в самом URL
+    (там технический ID файла) — расширение видно только в тексте ссылки
+    (например "Техническое задание.pdf"). Проверяем оба варианта.
     """
     pairs = re.findall(r'<a[^>]+href="([^"]+)"[^>]*>([^<]*)</a>', page_html, flags=re.IGNORECASE | re.DOTALL)
 
@@ -354,7 +345,7 @@ def extract_document_links(page_html: str) -> list:
         if url.startswith("//"):
             url = "https:" + url
         elif url.startswith("/"):
-            url = "https://zakupki.gov.ru" + url
+            url = base_domain + url
 
         # если расширение видно только в тексте ссылки, а не в самом URL —
         # запоминаем его отдельно, чтобы потом правильно выбрать парсер
@@ -408,32 +399,25 @@ def extract_text_from_file(filename: str, data: bytes) -> str:
 
 def gather_tender_documents_text(tender_page_url: str) -> str:
     """
-    Полный цикл: найти номер ЕИС → открыть страницу документов → скачать
-    файлы → извлечь текст. Возвращает '' при любой неудаче (тендер не с
-    ЕИС, файлы не найдены, скачивание не удалось и т.п.) — это ожидаемо
-    для значительной части тендеров и не считается ошибкой. Печатает
-    диагностику на каждом шаге, чтобы можно было понять, где отваливается.
+    Полный цикл: открыть страницу тендера на РосТендере с cookie сессии →
+    найти ссылки на файлы в разделе "Документация" → скачать → извлечь текст.
+    Возвращает '' при любой неудаче (cookie не задан/устарел, файлы не
+    найдены, скачивание не удалось и т.п.) — это не считается ошибкой, само
+    уведомление о тендере всё равно уходит. Печатает диагностику на каждом
+    шаге, чтобы можно было понять, где отваливается.
     """
-    reg_number, law_type = find_eis_reg_number(tender_page_url)
-    if not reg_number:
-        print(f"[диагностика] {tender_page_url} — номер ЕИС не найден на странице тендера")
+    page_html = fetch_tender_page_authorized(tender_page_url)
+    if not page_html:
         return ""
-    print(f"[диагностика] {tender_page_url} — найден номер ЕИС {reg_number} ({law_type}-ФЗ)")
 
-    docs_page_url = get_eis_documents_page_url(reg_number, law_type)
-    try:
-        docs_page_bytes = fetch_url_bytes(docs_page_url, timeout=20, max_bytes=3_000_000)
-        docs_page_html = docs_page_bytes.decode("utf-8", errors="ignore")
-    except Exception as exc:  # noqa: BLE001
-        print(f"[диагностика] Не удалось открыть страницу документов ЕИС ({docs_page_url}): {exc}")
-        return ""
-    print(f"[диагностика] Страница документов ЕИС открыта, размер {len(docs_page_html)} символов")
+    if "Войти" in page_html and "Личный кабинет" not in page_html:
+        print(f"[диагностика] {tender_page_url} — похоже, cookie не авторизует (страница выглядит как для гостя)")
 
-    doc_links = extract_document_links(docs_page_html)
+    doc_links = extract_document_links(page_html, base_domain="https://rostender.info")
     if not doc_links:
-        print(f"[диагностика] На странице документов ссылок на файлы не найдено ({docs_page_url})")
+        print(f"[диагностика] {tender_page_url} — на странице тендера ссылок на файлы не найдено")
         return ""
-    print(f"[диагностика] Найдено ссылок на файлы: {len(doc_links)} — {[name for _, name in doc_links]}")
+    print(f"[диагностика] {tender_page_url} — найдено ссылок на файлы: {len(doc_links)} — {[name for _, name in doc_links]}")
 
     all_text = []
     total_bytes = 0
@@ -441,7 +425,7 @@ def gather_tender_documents_text(tender_page_url: str) -> str:
         if total_bytes >= MAX_DOC_BYTES_TOTAL:
             break
         try:
-            data = fetch_url_bytes(doc_url, timeout=25, max_bytes=MAX_DOC_BYTES_TOTAL - total_bytes)
+            data = fetch_url_bytes(doc_url, timeout=25, max_bytes=MAX_DOC_BYTES_TOTAL - total_bytes, use_cookies=True)
             total_bytes += len(data)
             text = extract_text_from_file(filename_hint, data)
             print(f"[диагностика] Файл {filename_hint}: скачано {len(data)} байт, извлечено {len(text)} символов текста")
