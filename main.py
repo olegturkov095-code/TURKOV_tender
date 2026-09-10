@@ -20,14 +20,15 @@
    бот автоматически переключается на резервную сортировку по ключевым словам.
    Отправляем в Telegram ВСЕ тендеры по теме, с пометкой и пояснением, почему.
 5. Для подходящих (✅) тендеров ДОПОЛНИТЕЛЬНО пытаемся найти документацию:
-   документы лежат на самой странице тендера на РосТендере, но доступны
-   только авторизованным пользователям. Бот использует cookie сессии
-   (ROSTENDER_COOKIES) вашего аккаунта, чтобы открыть страницу как
-   залогиненный пользователь, находит там ссылки на файлы, скачивает
-   PDF/Word, вытаскивает текст и просит ИИ выделить упомянутые модели
-   оборудования и материалы. Если cookie не задан, устарел, файлы не
-   нашлись или что-то пошло не так — этот шаг просто пропускается, само
-   уведомление всё равно уходит.
+   через официальный API РосТендера (нужен ключ ROSTENDER_API_KEY из личного
+   кабинета: Профиль → Интеграции → API) запрашиваем полную карточку тендера
+   по его ID — там есть готовые ссылки на документы (архивом или по
+   отдельности). Скачиваем, вытаскиваем текст из PDF/Word и просим ИИ
+   выделить упомянутые модели оборудования и материалы. Если ключ не задан,
+   дневной лимит API исчерпан, у тендера нет документов или что-то пошло не
+   так — этот шаг просто пропускается, само уведомление всё равно уходит.
+   Чтобы не расходовать лимит запросов впустую, обрабатываем так не больше
+   MAX_DOCS_ANALYZED_PER_RUN тендеров за один запуск.
 6. Сохраняем обновлённый список увиденных ID.
 
 Требует установки библиотек pypdf и python-docx (см. requirements.txt) —
@@ -60,11 +61,11 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 AI_MODEL = "claude-haiku-4-5-20251001"  # самая быстрая и дешёвая модель — для этой задачи достаточно
 
-# Cookie авторизованной сессии РосТендера (строка вида "name1=value1; name2=value2").
-# Нужна, чтобы бот мог открывать раздел "Документация" на странице тендера —
-# он доступен только залогиненным пользователям. Если не задан, шаг анализа
-# документов просто пропускается.
-ROSTENDER_COOKIES = os.environ.get("ROSTENDER_COOKIES", "")
+# Ключ официального API РосТендера (Профиль → Интеграции → API, /profile/api
+# в личном кабинете). Нужен, чтобы получать карточку тендера с готовыми
+# ссылками на документы. Если не задан, шаг анализа документов просто
+# пропускается.
+ROSTENDER_API_KEY = os.environ.get("ROSTENDER_API_KEY", "")
 
 # Если true — просто помечаем все текущие тендеры как увиденные,
 # ничего не отправляя. Полезно для первого запуска / после смены источников,
@@ -143,8 +144,7 @@ ANALYZE_DOCUMENTS = os.environ.get("ANALYZE_DOCUMENTS", "true").strip().lower() 
 MAX_DOC_FILES = 5              # не более стольки файлов на тендер
 MAX_DOC_BYTES_TOTAL = 15_000_000  # суммарно не больше ~15 МБ на тендер
 MAX_DOC_TEXT_CHARS = 12_000     # сколько текста максимум отдаём ИИ (экономия токенов)
-
-EIS_DOC_EXTENSIONS = (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".zip", ".rtf")
+MAX_DOCS_ANALYZED_PER_RUN = 15  # не больше стольки тендеров за один запуск — экономим дневной лимит API
 
 # ---------------------------------------------------------------------------
 # Работа с состоянием (какие тендеры уже видели)
@@ -294,12 +294,9 @@ def classify(title: str, description: str) -> tuple:
 # ---------------------------------------------------------------------------
 
 
-def fetch_url_bytes(url: str, timeout: int = 20, max_bytes: int = 20_000_000, use_cookies: bool = False) -> bytes:
+def fetch_url_bytes(url: str, timeout: int = 20, max_bytes: int = 20_000_000) -> bytes:
     """Скачивает URL, ограничивая размер (защита от случайно огромных файлов)."""
-    headers = {"User-Agent": "Mozilla/5.0 (TenderMonitorBot/1.0)"}
-    if use_cookies and ROSTENDER_COOKIES:
-        headers["Cookie"] = ROSTENDER_COOKIES
-    req = urllib.request.Request(url, headers=headers)
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (TenderMonitorBot/1.0)"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         data = resp.read(max_bytes + 1)
     if len(data) > max_bytes:
@@ -307,59 +304,51 @@ def fetch_url_bytes(url: str, timeout: int = 20, max_bytes: int = 20_000_000, us
     return data
 
 
-def fetch_tender_page_authorized(tender_page_url: str) -> str:
+# Если дневной лимит API исчерпан — запоминаем это и больше не дёргаем API
+# до конца текущего запуска (сэкономит время, все попытки всё равно провалятся).
+_api_limit_exhausted = False
+
+
+def fetch_tender_card_from_api(tender_id: str) -> dict:
     """
-    Открывает страницу тендера на РосТендере с cookie авторизованной сессии
-    (если она задана), чтобы увидеть закрытый раздел "Документация".
-    Возвращает HTML страницы или '' при неудаче.
+    Запрашивает полную карточку тендера по его ID через официальный API
+    РосТендера (см. rostender.info/docs/api). Возвращает словарь "data" из
+    ответа, либо None при любой неудаче (тендер не найден, ключ неверный,
+    дневной лимит исчерпан и т.п.) — печатает диагностику в каждом случае.
     """
-    if not ROSTENDER_COOKIES:
-        print("[диагностика] ROSTENDER_COOKIES не задан — пропускаем анализ документов")
-        return ""
+    global _api_limit_exhausted
+
+    if not ROSTENDER_API_KEY:
+        return None
+    if _api_limit_exhausted:
+        return None
+
+    url = f"https://rostender.info/api/tenders/get/{tender_id}"
+    req = urllib.request.Request(url, headers={"X-API-KEY": ROSTENDER_API_KEY})
     try:
-        page_bytes = fetch_url_bytes(tender_page_url, timeout=20, max_bytes=3_000_000, use_cookies=True)
-        return page_bytes.decode("utf-8", errors="ignore")
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = json.loads(exc.read().decode("utf-8"))
+        except Exception:  # noqa: BLE001
+            payload = {}
+        code = payload.get("code", exc.code)
+        message = payload.get("message", str(exc))
+        print(f"[диагностика] API РосТендера: тендер {tender_id} — ошибка {code}: {message}")
+        if code == 403:
+            print("[диагностика] Похоже, дневной лимит API исчерпан — анализ документов пропускается до следующего запуска")
+            _api_limit_exhausted = True
+        return None
     except Exception as exc:  # noqa: BLE001
-        print(f"[диагностика] Не удалось открыть страницу тендера {tender_page_url}: {exc}")
-        return ""
+        print(f"[диагностика] Не удалось обратиться к API РосТендера для тендера {tender_id}: {exc}")
+        return None
 
+    if not payload.get("success"):
+        print(f"[диагностика] API РосТендера: тендер {tender_id} — success=false в ответе")
+        return None
 
-def extract_document_links(page_html: str, base_domain: str = "https://zakupki.gov.ru") -> list:
-    """
-    Ищет в HTML ссылки на файлы документации (PDF/DOC/XLS/ZIP и т.п.).
-    Реальные ссылки на скачивание часто не содержат расширения в самом URL
-    (там технический ID файла) — расширение видно только в тексте ссылки
-    (например "Техническое задание.pdf"). Проверяем оба варианта.
-    """
-    pairs = re.findall(r'<a[^>]+href="([^"]+)"[^>]*>([^<]*)</a>', page_html, flags=re.IGNORECASE | re.DOTALL)
-
-    doc_links = []
-    for href, link_text in pairs:
-        href_lower = href.lower()
-        text_lower = link_text.lower().strip()
-        looks_like_doc = href_lower.endswith(EIS_DOC_EXTENSIONS) or text_lower.endswith(EIS_DOC_EXTENSIONS)
-        if not looks_like_doc:
-            continue
-
-        url = href
-        if url.startswith("//"):
-            url = "https:" + url
-        elif url.startswith("/"):
-            url = base_domain + url
-
-        # если расширение видно только в тексте ссылки, а не в самом URL —
-        # запоминаем его отдельно, чтобы потом правильно выбрать парсер
-        filename_hint = link_text.strip() if text_lower.endswith(EIS_DOC_EXTENSIONS) else url.rsplit("/", 1)[-1]
-        doc_links.append((url, filename_hint))
-
-    # убираем дубликаты по URL, сохраняя порядок
-    seen_urls = set()
-    unique_links = []
-    for url, filename_hint in doc_links:
-        if url not in seen_urls:
-            seen_urls.add(url)
-            unique_links.append((url, filename_hint))
-    return unique_links[:MAX_DOC_FILES]
+    return payload.get("data") or {}
 
 
 def extract_text_from_file(filename: str, data: bytes) -> str:
@@ -397,46 +386,62 @@ def extract_text_from_file(filename: str, data: bytes) -> str:
         return ""
 
 
-def gather_tender_documents_text(tender_page_url: str) -> str:
+def gather_tender_documents_text(tender_id: str) -> str:
     """
-    Полный цикл: открыть страницу тендера на РосТендере с cookie сессии →
-    найти ссылки на файлы в разделе "Документация" → скачать → извлечь текст.
-    Возвращает '' при любой неудаче (cookie не задан/устарел, файлы не
-    найдены, скачивание не удалось и т.п.) — это не считается ошибкой, само
-    уведомление о тендере всё равно уходит. Печатает диагностику на каждом
-    шаге, чтобы можно было понять, где отваливается.
+    Полный цикл: запросить карточку тендера через официальный API →
+    скачать документы (архивом или по отдельности, по ссылкам из карточки)
+    → извлечь текст. Возвращает '' при любой неудаче (ключ не задан,
+    лимит исчерпан, у тендера нет документов и т.п.) — это не считается
+    ошибкой, само уведомление о тендере всё равно уходит. Печатает
+    диагностику на каждом шаге.
     """
-    page_html = fetch_tender_page_authorized(tender_page_url)
-    if not page_html:
+    card = fetch_tender_card_from_api(tender_id)
+    if not card:
         return ""
 
-    if "Войти" in page_html and "Личный кабинет" not in page_html:
-        print(f"[диагностика] {tender_page_url} — похоже, cookie не авторизует (страница выглядит как для гостя)")
+    files_info = card.get("files") or {}
+    archive_url = files_info.get("archive")
+    items = files_info.get("items") or []
 
-    doc_links = extract_document_links(page_html, base_domain="https://rostender.info")
-    if not doc_links:
-        print(f"[диагностика] {tender_page_url} — на странице тендера ссылок на файлы не найдено")
+    if not archive_url and not items:
+        print(f"[диагностика] Тендер {tender_id}: в карточке API нет документов")
         return ""
-    print(f"[диагностика] {tender_page_url} — найдено ссылок на файлы: {len(doc_links)} — {[name for _, name in doc_links]}")
 
     all_text = []
     total_bytes = 0
-    for doc_url, filename_hint in doc_links:
-        if total_bytes >= MAX_DOC_BYTES_TOTAL:
-            break
+
+    if archive_url:
         try:
-            data = fetch_url_bytes(doc_url, timeout=25, max_bytes=MAX_DOC_BYTES_TOTAL - total_bytes, use_cookies=True)
+            data = fetch_url_bytes(archive_url, timeout=30, max_bytes=MAX_DOC_BYTES_TOTAL)
             total_bytes += len(data)
-            text = extract_text_from_file(filename_hint, data)
-            print(f"[диагностика] Файл {filename_hint}: скачано {len(data)} байт, извлечено {len(text)} символов текста")
+            text = extract_text_from_file("archive.zip", data)
+            print(f"[диагностика] Тендер {tender_id}: скачан общий архив документов, {len(data)} байт, извлечено {len(text)} символов")
             if text.strip():
                 all_text.append(text)
         except Exception as exc:  # noqa: BLE001
-            print(f"[диагностика] Не удалось скачать/разобрать файл {filename_hint}: {exc}")
-            continue
+            print(f"[диагностика] Тендер {tender_id}: не удалось скачать общий архив ({exc}), попробуем файлы по отдельности")
+
+    if not all_text:
+        for item in items[:MAX_DOC_FILES]:
+            if total_bytes >= MAX_DOC_BYTES_TOTAL:
+                break
+            link = item.get("link")
+            title = item.get("title") or "файл"
+            if not link:
+                continue
+            try:
+                data = fetch_url_bytes(link, timeout=25, max_bytes=MAX_DOC_BYTES_TOTAL - total_bytes)
+                total_bytes += len(data)
+                text = extract_text_from_file(title, data)
+                print(f"[диагностика] Файл {title}: скачано {len(data)} байт, извлечено {len(text)} символов")
+                if text.strip():
+                    all_text.append(text)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[диагностика] Не удалось скачать/разобрать файл {title}: {exc}")
+                continue
 
     combined = "\n\n---\n\n".join(all_text)
-    print(f"[диагностика] Итого текста для анализа: {len(combined)} символов")
+    print(f"[диагностика] Тендер {tender_id}: итого текста для анализа {len(combined)} символов")
     return combined[:MAX_DOC_TEXT_CHARS]
 
 
@@ -494,7 +499,7 @@ def summarize_equipment_with_ai(documents_text: str) -> str:
     return ""
 
 
-def analyze_tender_documents(tender_page_url: str) -> str:
+def analyze_tender_documents(tender_id: str) -> str:
     """
     Оркестрирует весь цикл анализа документации. Никогда не бросает
     исключение наружу — при любой проблеме просто возвращает ''.
@@ -502,7 +507,7 @@ def analyze_tender_documents(tender_page_url: str) -> str:
     if not ANALYZE_DOCUMENTS:
         return ""
     try:
-        documents_text = gather_tender_documents_text(tender_page_url)
+        documents_text = gather_tender_documents_text(tender_id)
         if not documents_text:
             return ""
         return summarize_equipment_with_ai(documents_text)
@@ -566,6 +571,7 @@ def main() -> None:
     sent_stop = 0
     skipped_off_topic = 0
     postponed_quiet_hours = 0
+    docs_analyzed_count = 0
 
     quiet_now = is_quiet_hours()
     if quiet_now and not SEED_ONLY:
@@ -614,8 +620,9 @@ def main() -> None:
 
             message = format_message(title, description, link, pub_date, marker, reason)
 
-            if marker == "✅":
-                equipment_summary = analyze_tender_documents(link)
+            if marker == "✅" and docs_analyzed_count < MAX_DOCS_ANALYZED_PER_RUN:
+                docs_analyzed_count += 1
+                equipment_summary = analyze_tender_documents(tender_id)
                 if equipment_summary:
                     message = format_message(
                         title, description, link, pub_date, marker, reason, equipment_summary
@@ -649,7 +656,8 @@ def main() -> None:
     else:
         print(
             f"[готово] Отправлено тендеров: {sent_count} (✅ подходящие: {sent_ok}, 🛑 обслуживание/ремонт: {sent_stop}). "
-            f"Отфильтровано как не по теме: {skipped_off_topic}."
+            f"Отфильтровано как не по теме: {skipped_off_topic}. "
+            f"Проанализировано документов: {docs_analyzed_count}."
         )
 
 
