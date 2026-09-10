@@ -118,8 +118,8 @@ STATE_FILE = Path(__file__).parent / "seen_tenders.json"
 # уведомления. Тендеры, найденные в это время, никуда не пропадают: они
 # просто не помечаются как отправленные и уйдут одним пакетом, как только
 # тихие часы закончатся.
-QUIET_HOURS_START_MSK = 0  # с 23:59 МСК
-QUIET_HOURS_END_MSK = 0     # до 08:00 МСК
+QUIET_HOURS_START_MSK = 22  # с 22:00 МСК
+QUIET_HOURS_END_MSK = 8     # до 08:00 МСК
 
 # ---------------------------------------------------------------------------
 # Анализ документации тендера (ЕИС) — экспериментальная функция
@@ -305,7 +305,8 @@ def find_eis_reg_number(tender_page_url: str) -> tuple:
     try:
         page_bytes = fetch_url_bytes(tender_page_url, timeout=20, max_bytes=3_000_000)
         page_text = page_bytes.decode("utf-8", errors="ignore")
-    except Exception:
+    except Exception as exc:  # noqa: BLE001
+        print(f"[диагностика] Не удалось открыть страницу тендера {tender_page_url}: {exc}")
         return None, None
 
     # Прямая ссылка на извещение 44-ФЗ на zakupki.gov.ru
@@ -410,22 +411,29 @@ def gather_tender_documents_text(tender_page_url: str) -> str:
     Полный цикл: найти номер ЕИС → открыть страницу документов → скачать
     файлы → извлечь текст. Возвращает '' при любой неудаче (тендер не с
     ЕИС, файлы не найдены, скачивание не удалось и т.п.) — это ожидаемо
-    для значительной части тендеров и не считается ошибкой.
+    для значительной части тендеров и не считается ошибкой. Печатает
+    диагностику на каждом шаге, чтобы можно было понять, где отваливается.
     """
     reg_number, law_type = find_eis_reg_number(tender_page_url)
     if not reg_number:
+        print(f"[диагностика] {tender_page_url} — номер ЕИС не найден на странице тендера")
         return ""
+    print(f"[диагностика] {tender_page_url} — найден номер ЕИС {reg_number} ({law_type}-ФЗ)")
 
     docs_page_url = get_eis_documents_page_url(reg_number, law_type)
     try:
         docs_page_bytes = fetch_url_bytes(docs_page_url, timeout=20, max_bytes=3_000_000)
         docs_page_html = docs_page_bytes.decode("utf-8", errors="ignore")
-    except Exception:
+    except Exception as exc:  # noqa: BLE001
+        print(f"[диагностика] Не удалось открыть страницу документов ЕИС ({docs_page_url}): {exc}")
         return ""
+    print(f"[диагностика] Страница документов ЕИС открыта, размер {len(docs_page_html)} символов")
 
     doc_links = extract_document_links(docs_page_html)
     if not doc_links:
+        print(f"[диагностика] На странице документов ссылок на файлы не найдено ({docs_page_url})")
         return ""
+    print(f"[диагностика] Найдено ссылок на файлы: {len(doc_links)} — {[name for _, name in doc_links]}")
 
     all_text = []
     total_bytes = 0
@@ -436,12 +444,15 @@ def gather_tender_documents_text(tender_page_url: str) -> str:
             data = fetch_url_bytes(doc_url, timeout=25, max_bytes=MAX_DOC_BYTES_TOTAL - total_bytes)
             total_bytes += len(data)
             text = extract_text_from_file(filename_hint, data)
+            print(f"[диагностика] Файл {filename_hint}: скачано {len(data)} байт, извлечено {len(text)} символов текста")
             if text.strip():
                 all_text.append(text)
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
+            print(f"[диагностика] Не удалось скачать/разобрать файл {filename_hint}: {exc}")
             continue
 
     combined = "\n\n---\n\n".join(all_text)
+    print(f"[диагностика] Итого текста для анализа: {len(combined)} символов")
     return combined[:MAX_DOC_TEXT_CHARS]
 
 
