@@ -33,6 +33,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ROSTENDER_COOKIES: ${{ secrets.ROSTENDER_COOKIES }}
           SEED_ONLY: ${{ github.event.inputs.seed_only || 'false' }}
         run: python main.py
 
